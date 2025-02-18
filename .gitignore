@@ -1,5 +1,4 @@
 __pycache__
-vendor/
 .DS_Store
 venv
 .env
