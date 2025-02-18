@@ -1,9 +1,4 @@
-from setuptools import setup, find_packages, Extension
-
-dummy_extension = Extension(
-    name="repomap._dummy",       # The module name (must be a valid Python module path)
-    sources=["src/dummy.c"],     # Path to the dummy C source file
-)
+from setuptools import setup, find_packages
 
 setup(
     name="repomap",
@@ -21,5 +16,4 @@ setup(
     package_data={
         "repomap": ["vendor/**/*", "queries/**/*"],  # Ensure vendor files are included
     },
-    ext_modules=[dummy_extension],
 )
