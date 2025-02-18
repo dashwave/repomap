@@ -5,14 +5,18 @@ from pathlib import Path
 from tqdm import tqdm
 import logging
 import os
-from grep_ast import TreeContext, filename_to_lang
-from tree_sitter_languages import get_language, get_parser  # noqa: E402
+from repomap.vendor.grep_ast import TreeContext, filename_to_lang
+from tree_sitter_language_pack import get_language, get_parser  # noqa: E402
 from pygments.lexers import guess_lexer_for_filename
 from importlib import resources
 from pygments.token import Token
 import time
-import tree_sitter_languages
 import tiktoken
+from typing import List, Tuple
+from tree_sitter import Node
+import json
+import networkx as nx
+
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("get-repo-map")
@@ -28,12 +32,82 @@ def get_scm_fname(lang):
         return
 
 
+def print_tree(node, indent=0):
+    # # """
+    # # Recursively prints the Tree-sitter AST starting at 'node'.
+    
+    # # Each node is printed with indentation proportional to its depth.
+    # # If the node has associated text (e.g. an identifier), that text is printed,
+    # # truncated to a reasonable length.
+    # # """
+    # indent_str = "  " * indent
+    # # Attempt to get the node's text if available.
+    # try:
+    #     # node.text may be a byte string; decode it if needed.
+    #     text = node.text.decode("utf8") if isinstance(node.text, bytes) else node.text
+    #     text = text.strip()
+    # except Exception:
+    #     text = ""
+    
+    # # Optionally, truncate text if it's too long.
+    # if len(text) > 40:
+    #     text = text[:37] + "..."
+    
+    # # Print node type (and text if present)
+    # if text:
+    #     print(f"{indent_str}{node.type}: {text}")
+    # else:
+    #     print(f"{indent_str}{node.type}")
+    
+    # # Recursively print each child node.
+    # for child in node.children:
+    #     print_tree(child, indent + 1)
+    ast_dict = node_to_dict(node)
+    print(json.dumps(ast_dict, indent=2))
+
+def node_to_dict(node):
+    """
+    Recursively converts a Tree-sitter node into a dictionary.
+    """
+    node_dict = {
+        "type": node.type,
+        "start_byte": node.start_byte,
+        "end_byte": node.end_byte,
+        "start_point": node.start_point,  # (row, column)
+        "end_point": node.end_point,      # (row, column)
+    }
+    
+    # Recursively process children if they exist.
+    children = [node_to_dict(child) for child in node.children]
+    if children:
+        node_dict["children"] = children
+        for i, child in enumerate(children):
+            node_dict["children"][i]["field_name"] = node.field_name_for_child(i)
+    try:
+        text = node.text
+        if isinstance(text, bytes):
+            text = text.decode("utf8")
+        text = text.strip()
+        if text:
+            node_dict["text"] = text
+    except Exception:
+        pass
+    
+    return node_dict
 class RepoMap:
     warned_files = set()
 
-    def __init__(self, root, verbose=False):
+    def __init__(self,
+            root,
+            verbose=False,
+            max_map_tokens=20000,
+            map_mul_no_files=0.5,
+            max_context_window=2000000
+        ):
         self.root = root
-        self.max_map_tokens = 4096
+        self.max_map_tokens = max_map_tokens
+        self.map_mul_no_files = map_mul_no_files
+        self.max_context_window = max_context_window
         self.verbose = verbose
         self.tree_context_cache = {}
 
@@ -116,7 +190,6 @@ class RepoMap:
             self.max_map_tokens = 0
             return None
         
-        logger.info(f"files_listing: <{files_listing}>")
 
         if not files_listing:
             return None
@@ -124,7 +197,6 @@ class RepoMap:
         # Log token count if verbose
         if self.verbose:
             num_tokens = self.token_count(files_listing)
-            logger.info(f"Repo-map: {num_tokens / 1024:.1f} k-tokens")
 
         # Format the final output
         other = "other " if chat_files else ""
@@ -141,12 +213,10 @@ class RepoMap:
     def get_ranked_tags(
         self, chat_fnames, other_fnames, mentioned_fnames, mentioned_idents, progress=None
     ):
-        import networkx as nx
-
         defines = defaultdict(set)
         references = defaultdict(list)
         definitions = defaultdict(set)
-
+        imports = defaultdict(set)
         personalization = dict()
 
         fnames = set(chat_fnames).union(set(other_fnames))
@@ -184,6 +254,9 @@ class RepoMap:
                 personalization[rel_fname] = personalize
 
             tags = list(self.get_tags(fname, rel_fname))
+            logger.debug(f"tags for {rel_fname}:")
+            for tag in tags:
+                logger.debug(f"  {tag}")
             if tags is None:
                 continue
 
@@ -196,15 +269,18 @@ class RepoMap:
                 elif tag.kind == "ref":
                     references[tag.name].append(rel_fname)
 
+                elif tag.kind == "import":
+                    imports[tag.name].add(rel_fname)
+                    key = (tag.name, "import")
+                    definitions[key].add(tag)
+
         ##
         # dump(defines)
         # dump(references)
         # dump(personalization)
-
-        logger.info(f"defines: {defines}")
-        logger.info(f"references: {references}")
-        logger.info(f"definitions: {definitions}")
-
+        # logger.debug(f"defines: {defines}")
+        # logger.debug(f"references: {references}")
+        # logger.debug(f"personalization: {personalization}")
 
         if not references:
             references = dict((k, list(v)) for k, v in defines.items())
@@ -232,6 +308,12 @@ class RepoMap:
                     num_refs = math.sqrt(num_refs)
 
                     G.add_edge(referencer, definer, weight=mul * num_refs, ident=ident)
+        
+
+        for import_name, fnames in imports.items():
+            for fname in fnames:
+                print(f"adding edge for import: {fname} -> {import_name}")
+                G.add_edge(fname, import_name, weight=10, ident="import")
 
         if not references:
             pass
@@ -252,6 +334,8 @@ class RepoMap:
 
         # distribute the rank from each source node, across all of its out edges
         ranked_definitions = defaultdict(float)
+        # print(f"G.nodes: {G.nodes}")
+        # print(f"Ranked: {ranked}")
         for src in G.nodes:
             if progress:
                 progress()
@@ -268,6 +352,8 @@ class RepoMap:
         ranked_definitions = sorted(
             ranked_definitions.items(), reverse=True, key=lambda x: (x[1], x[0])
         )
+
+        print(f"ranked_definitions: {ranked_definitions}")
 
         # dump(ranked_definitions)
 
@@ -309,11 +395,17 @@ class RepoMap:
         return data
 
     def get_tags_raw(self, fname, rel_fname):
-        lang = filename_to_lang(fname)
+        file_extension = os.path.splitext(fname)[1]
+        if file_extension == ".dart":
+            lang = "dart"
+        else:
+            lang = filename_to_lang(fname)
+        logger.info(f"lang: {lang}")
         if not lang:
             return
 
         try:
+            # init language
             language = get_language(lang)
             parser = get_parser(lang)
         except Exception as err:
@@ -331,16 +423,34 @@ class RepoMap:
 
         # Run the tags queries
         query = language.query(query_scm)
-        captures = query.captures(tree.root_node)
+        captures = query.captures(tree.root_node)        
+        captures_list: List[Tuple[str, List[Node]]] = []
 
-        captures = list(captures)
-
+        for k,v in captures.items():
+            for node in v:
+                captures_list.append((k, node))
         saw = set()
-        for node, tag in captures:
-            if tag.startswith("name.definition."):
+        for tag, node in captures_list:
+            # logger.info(f"tag: {tag}, node: {node}, {type(node)}")
+            # logger.info(f"node: {node.text.decode('utf-8')}")
+            if tag.startswith("name.definition"):
                 kind = "def"
-            elif tag.startswith("name.reference."):
+                name = node.text.decode("utf-8")
+            elif tag.startswith("name.reference"):
                 kind = "ref"
+                name = node.text.decode("utf-8")
+            elif tag.startswith("name.import"):
+                kind = "import"
+                name = node.text.decode("utf-8")
+                # remove the quotes
+                name = name.strip("'")
+                if not name.startswith("package:"):
+                    # if the name is not a package name, it is a relative path
+                    # so we need to join it with the directory of the current file
+                    # to get the full path
+                    name = os.path.normpath(os.path.join(os.path.dirname(rel_fname), name))
+                else:
+                    continue
             else:
                 continue
 
@@ -349,7 +459,7 @@ class RepoMap:
             result = Tag(
                 rel_fname=rel_fname,
                 fname=fname,
-                name=node.text.decode("utf-8"),
+                name=name,
                 kind=kind,
                 line=node.start_point[0],
             )
@@ -375,6 +485,7 @@ class RepoMap:
         tokens = [token[1] for token in tokens if token[0] in Token.Name]
 
         for token in tokens:
+            logger.info(f"yielding token from lexer: {token}")
             yield Tag(
                 rel_fname=rel_fname,
                 fname=fname,
@@ -424,6 +535,10 @@ class RepoMap:
             mentioned_idents,
         )
 
+        logger.info(f"ranked_tags:")
+        for tag in ranked_tags:
+            logger.info(f"  ranked_tag: {tag}")
+
 
         other_rel_fnames = sorted(set(self.get_rel_fname(fname) for fname in other_fnames))
         # special_fnames = filter_important_files(other_rel_fnames)
@@ -433,7 +548,6 @@ class RepoMap:
         special_fnames = [(fn,) for fn in special_fnames]
 
         ranked_tags = special_fnames + ranked_tags
-        logger.info(f"ranked_tags: {ranked_tags}")
 
         num_tags = len(ranked_tags)
         lower_bound = 0
@@ -448,14 +562,11 @@ class RepoMap:
         middle = min(int(max_map_tokens // 25), num_tags)
         while lower_bound <= upper_bound:
             # dump(lower_bound, middle, upper_bound)
-            logger.info(f"lower_bound: {lower_bound}, middle: {middle}, upper_bound: {upper_bound}")
             tree = self.to_tree(ranked_tags[:middle], chat_rel_fnames)
             num_tokens = self.token_count(tree)
-            logger.info(f"tree: {tree}")
-            logger.info(f"num_tokens: {num_tokens}")
 
             pct_err = abs(num_tokens - max_map_tokens) / max_map_tokens
-            ok_err = 0.15
+            ok_err = 0.05
             if (num_tokens <= max_map_tokens and num_tokens > best_tree_tokens) or pct_err < ok_err:
                 best_tree = tree
                 best_tree_tokens = num_tokens
@@ -475,10 +586,10 @@ class RepoMap:
     tree_cache = dict()
 
     def to_tree(self, tags, chat_rel_fnames):
+        logger.info(f"to_tree tags: {tags}")
         if not tags:
             return ""
 
-        logger.debug(f"calling to_tree for tags: {tags} and chat_rel_fnames: {chat_rel_fnames}")
         cur_fname = None
         cur_abs_fname = None
         lois = None
@@ -496,6 +607,7 @@ class RepoMap:
                 if lois is not None:
                     output += "\n"
                     output += cur_fname + ":\n"
+                    print(f"calling render_tree for {cur_fname}: {lois}")
                     output += self.render_tree(cur_abs_fname, cur_fname, lois)
                     lois = None
                 elif cur_fname:
@@ -516,6 +628,7 @@ class RepoMap:
     def render_tree(self, abs_fname, rel_fname, lois):
         mtime = self.get_mtime(abs_fname)
 
+        context: TreeContext = None
         if (
             rel_fname not in self.tree_context_cache
             or self.tree_context_cache[rel_fname]["mtime"] != mtime
@@ -527,8 +640,8 @@ class RepoMap:
             context = TreeContext(
                 rel_fname,
                 code,
-                color=False,
-                line_number=False,
+                color=True,
+                line_number=True,
                 child_context=False,
                 last_line=False,
                 margin=0,
@@ -541,6 +654,7 @@ class RepoMap:
 
         context = self.tree_context_cache[rel_fname]["context"]
         context.lines_of_interest = set()
+        logger.info(f"lois for {rel_fname}: {lois}")
         context.add_lines_of_interest(lois)
         context.add_context()
         res = context.format()

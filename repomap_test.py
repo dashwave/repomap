@@ -3,7 +3,9 @@ from tempfile import TemporaryDirectory
 from repomap.repomap import RepoMap
 import sys
 import tempfile
-
+from tree_sitter_language_pack import get_language, get_parser
+import json
+from repomap.repomap import node_to_dict
 class IgnorantTemporaryDirectory:
     def __init__(self):
         if sys.version_info >= (3, 10):
@@ -26,34 +28,60 @@ class IgnorantTemporaryDirectory:
     def __getattr__(self, item):
         return getattr(self.temp_dir, item)
 
+ignore_directories = [".git", "node_modules", "ios", "android", "ios/build", "android/build", "windows", "linux", "macos", "web", "linux/build", "macos/build", "web/build"]
+ignore_files = [".gitignore", "METADATA", "package.json", "package-lock.json", "package.yaml", "package.lockb", "package.lockb.json", "package.lockb.yaml", "package.lockb.toml"]
+ignore_extensions = [".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".xml", ".css", ".js", ".jsx", ".ts", ".md", ".txt", ".log", ".yml", ".yaml", ".toml", ".lock", ".lockb", ".lockb.json", ".lockb.yaml", ".lockb.toml", ".ttf", ".json", ".lock", ".arb", ".yaml.lock", ".bat"]
+
+def get_all_files(project_dir):
+    all_files = []
+    for root, dirs, files in os.walk(project_dir):
+        # Remove directories that should be ignored so that os.walk doesn't traverse them.
+        dirs[:] = [d for d in dirs if d not in ignore_directories]
+
+        for file in files:
+            if file in ignore_files:
+                continue
+            if os.path.splitext(file)[1] in ignore_extensions:
+                continue
+            all_files.append(os.path.join(root, file))
+    return all_files
+
 def test_get_repo_map_excludes_added_files():
-    # Create a temporary directory with sample files for testing
-    test_files = [
-        "test_file1.py",
-        "test_file2.py",
-        "test_file3.md",
-        "test_file4.json",
-    ]
+    # list all files from the project directory recursively
+    project_dir = "/Users/burnerlee/Projects/random/scratch-workspace-flutter"
+    files = get_all_files(project_dir)
 
-    with IgnorantTemporaryDirectory() as temp_dir:
-        for file in test_files:
-            with open(os.path.join(temp_dir, file), "w") as f:
-                f.write("def foo(): pass\n")
+    for file in files:
+        print(f"file: {file}")
+    # print(f"files: {files}")
+    # dump(result)
 
-        repo_map = RepoMap(root=temp_dir, verbose=True)
-        test_files = [os.path.join(temp_dir, file) for file in test_files]
-        result = repo_map.get_repo_map(test_files[2:], test_files[:2])
-
-        print(f"result >>>>>>>>>>>\n{result}\n<<<<<<<<<<<<")
-        # dump(result)
-
-        # Check if the result contains the expected tags map
-        assert "test_file1.py" not in result
-        assert "test_file2.py" not in result
-        assert "test_file3.md" in result
-        assert "test_file4.json" in result
-
-        # close the open cache files, so Windows won't error
-        del repo_map
+    # Check if the result contains the expected tags map
+    repo_map = RepoMap(project_dir)
+    result = repo_map.get_repo_map([], files)
+    token = repo_map.token_count(result)
+    print(f"result: {result}")
+    print(f"token: {token}")
+    # close the open cache files, so Windows won't error
+    del repo_map
 
 test_get_repo_map_excludes_added_files()
+
+def test_dart_tags():
+    main_dart_file = os.path.join(os.path.dirname(__file__), "main.dart")
+    file_content = open(main_dart_file).read()
+
+    parser = get_parser("dart")
+    language = get_language("dart")
+    tree = parser.parse(bytes(file_content, "utf-8"))
+
+    # tree_dict = node_to_dict(tree.root_node)
+    # print(json.dumps(tree_dict, indent=2))
+    query_scm = open(os.path.join(os.path.dirname(__file__), "repomap", "queries", "tree-sitter-dart-tags.scm")).read()
+
+    # Run the tags queries
+    query = language.query(query_scm)
+    captures = query.captures(tree.root_node) 
+    print(captures)
+
+# test_dart_tags()

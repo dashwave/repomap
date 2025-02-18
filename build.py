@@ -1,7 +1,7 @@
 import os
 import subprocess
 import sys
-from tree_sitter import Language
+from tree_sitter_language_pack import Language
 
 
 repos = []
@@ -40,6 +40,7 @@ else:
     languages_filename = "tree_sitter_languages/languages.so"
 
 print(f"{sys.argv[0]}: Building", languages_filename)
+
 Language.build_library(
     languages_filename,
     [
