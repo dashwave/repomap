@@ -391,7 +391,12 @@ class RepoMap:
         file_mtime = self.get_mtime(fname)
         if file_mtime is None:
             return []
-        data = list(self.get_tags_raw(fname, rel_fname))
+        try:
+            data = list(self.get_tags_raw(fname, rel_fname))
+        except Exception as err:
+            logger.warning(f"Error getting tags for {fname}: {err}")
+            self.warned_files.add(fname)
+            return []
         return data
 
     def get_tags_raw(self, fname, rel_fname):
@@ -659,3 +664,6 @@ class RepoMap:
         context.add_context()
         res = context.format()
         return res
+
+    def get_warned_files(self):
+        return self.warned_files
